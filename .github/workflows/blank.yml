@@ -1,35 +1,78 @@
-name: Android Emulator with Tailscale
+name: Android Emulator with Tailscale (ARM64 Translation)
 
 on:
-  push:
-    branches: [ main ]
-  workflow_dispatch: 
+  workflow_dispatch:
+    inputs:
+      api_level:
+        description: 'Android API Level'
+        required: true
+        type: choice
+        options:
+          - '28'
+          - '29'
+          - '30'
+          - '31'
+          - '32'
+        default: '30'
+      runtime_minutes:
+        description: '模拟器运行时间 (分钟)'
+        required: true
+        type: number
+        default: '60'
+      enable_arm_translation:
+        description: '启用 ARM64 应用转译'
+        required: true
+        type: boolean
+        default: true
 
 jobs:
   run-cloud-emulator:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
+    
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Install Dependencies
+      - name: 最大化运行器磁盘空间
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
+          sudo apt-get autoremove -y && sudo apt-get autoclean -y
+          sudo rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
+          sudo docker system prune -a -f || true
+          echo "✅ 磁盘空间优化完成：$(df -h / | tail -1 | awk '{print $4}')"
+
+      - name: 安装基础依赖
         run: |
           sudo apt-get update
-          sudo apt-get install -y libpulse0
+          sudo apt-get install -y \
+            libpulse0 \
+            libxcb1 \
+            libxcb-image0 \
+            libxcb-keysyms1 \
+            libxcb-randr0 \
+            libxcb-render-util0 \
+            libxkbcommon-x11-0 \
+            libgl1-mesa-glx \
+            libegl1-mesa \
+            libdbus-1-3
 
-      - name: Enable KVM
+      - name: 启用 KVM (增强版)
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
+          ls -la /dev/kvm
+          chmod 666 /dev/kvm
+          echo "✅ KVM 已启用并验证"
 
-      - name: Setup Tailscale
+      - name: 配置 Tailscale
         uses: tailscale/github-action@v2
         with:
           authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
-          hostname: github-android-emulator
+          hostname: github-android-emulator-${{ github.run_id }}
 
-      - name: Get Tailscale IP
+      - name: 获取 Tailscale IP
         id: tailscale_ip
         run: |
           TS_IP=$(tailscale ip -4)
@@ -37,39 +80,96 @@ jobs:
           echo "======================================================"
           echo "✅ Tailscale 已上线！"
           echo "👉 分配的内网 IP: $TS_IP"
-          echo "👉 连接命令: adb connect $TS_IP:5555"
+          echo "👉 ADB 连接命令: adb connect $TS_IP:5555"
           echo "======================================================"
 
-      - name: Run Android Emulator
+      - name: 运行 Android 模拟器 (支持 ARM64 转译)
         uses: reactivecircus/android-emulator-runner@v2
+        timeout-minutes: ${{ github.event.inputs.runtime_minutes }}
         with:
-          api-level: 30
+          api-level: ${{ github.event.inputs.api_level }}
+          target: ${{ github.event.inputs.enable_arm_translation == true && 'google_apis' || 'default' }}
           arch: x86_64
           profile: pixel_4
-          ram-size: 2048M
-          disk-size: 2048M
-          emulator-options: -no-snapshot-save -noaudio -no-boot-anim -camera-back none -gpu swiftshader_indirect
+          ram-size: 4096M
+          disk-size: 8192M
+          hw-acceleration: true
+          emulator-options: >-
+            -no-snapshot-save
+            -no-boot-anim
+            -camera-back none
+            -gpu swiftshader_indirect
+            -no-snapshot
+            -no-snapshot-load
           disable-animations: true
           script: |
             echo "⏳ 正在等待 Emulator 系统开机..."
+            
+            # 等待 ADB 设备就绪
             adb wait-for-device
+            
+            # 检查boot_completed状态
             COUNT=0
-            while true; do
-              OUT=$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || echo "未就绪")
+            MAX_COUNT=40
+            while [ $COUNT -lt $MAX_COUNT ]; do
+              OUT=$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || echo "")
               if [ "$OUT" == "1" ]; then
                 echo "🎉 Emulator 已启动完毕并准备就绪！"
                 break
               fi
               echo "👀 检查中... 状态: ${OUT:-'未就绪'} (已等待 $((COUNT * 5)) 秒)"
               sleep 5
-              COUNT=$((COUNT+1))
-              if [ $COUNT -gt 36 ]; then
-                echo "❌ Emulator 启动超时！"
-                adb logcat | tail -n 50
-                exit 1
+              COUNT=$((COUNT + 1))
+            done
+            
+            if [ $COUNT -ge $MAX_COUNT ]; then
+              echo "❌ Emulator 启动超时！"
+              echo "--- 最后50行 logcat ---"
+              adb logcat -d | tail -n 50
+              echo "--- Emulator 状态 ---"
+              adb devices -l
+              exit 1
+            fi
+            
+            # 配置 ADB over TCP
+            echo "--- 配置 ADB over TCP ---"
+            adb tcpip 5555
+            sleep 2
+            
+            # 输出连接信息
+            TS_IP="${{ steps.tailscale_ip.outputs.TS_IP }}"
+            echo "======================================================"
+            echo "✅ Android Emulator 已就绪！"
+            echo "📱 设备信息:"
+            adb shell getprop ro.build.version.release
+            adb shell getprop ro.product.model
+            echo "🌐 Tailscale IP: $TS_IP"
+            echo "🔌 远程连接命令:"
+            echo "   adb connect $TS_IP:5555"
+            echo "======================================================"
+            
+            # 保持运行
+            echo "⏳ 模拟器将在 ${{ github.event.inputs.runtime_minutes }} 分钟后自动销毁..."
+            REMAINING=$(( ${{ github.event.inputs.runtime_minutes }} * 60 ))
+            while [ $REMAINING -gt 0 ]; do
+              # 检查设备是否仍然在线
+              if ! adb devices | grep -q "device$"; then
+                echo "⚠️ 警告: 设备似乎已断开，尝试重新连接..."
+                adb start-server
+                adb tcpip 5555
+              fi
+              sleep 60
+              REMAINING=$((REMAINING - 60))
+              if [ $((REMAINING % 300)) -eq 0 ]; then
+                echo "💡 剩余运行时间: $((REMAINING / 60)) 分钟"
               fi
             done
-            # 暴露 ADB 到 Tailscale IP（默认已通过 Tailscale 网络可用）
-            echo "现在你可以通过 Tailscale 远程连接 ADB 了！"
-            echo "容器将在 1 小时后自动销毁..."
-            sleep 3600
+            
+            echo "✅ 运行时间已到，工作流即将结束"
+
+      - name: 输出调试信息
+        if: always()
+        run: |
+          echo "--- 工作流执行完成 ---"
+          echo "Tailscale IP: ${{ steps.tailscale_ip.outputs.TS_IP }}"
+          echo "运行状态: ${{ job.status }}"
