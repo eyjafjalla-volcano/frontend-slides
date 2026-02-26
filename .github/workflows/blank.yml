@@ -18,37 +18,14 @@ jobs:
           sudo apt-get install -y dkms linux-headers-$(uname -r) git
           git clone https://github.com/Etaash-mathamsetty/anbox-modules.git
           cd anbox-modules
-          echo "diff --git a/binder/binder.c b/binder/binder.c" > linux-6.1.patch
-          echo "index d6c6c1f..ede8edb 100644" >> linux-6.1.patch
-          echo "--- a/binder/binder.c" >> linux-6.1.patch
-          echo "+++ b/binder/binder.c" >> linux-6.1.patch
-          echo "@@ -4109,10 +4109,16 @@ static int binder_wait_for_work(struct binder_thread *thread," >> linux-6.1.patch
-          echo " struct binder_proc *proc = thread->proc;" >> linux-6.1.patch
-          echo " int ret = 0;" >> linux-6.1.patch
-          echo "" >> linux-6.1.patch
-          echo "+#if (LINUX_VERSION_CODE < KERNEL_VERSION(6,1,0))" >> linux-6.1.patch
-          echo " freezer_do_not_count();" >> linux-6.1.patch
-          echo "+#endif" >> linux-6.1.patch
-          echo " binder_inner_proc_lock(proc);" >> linux-6.1.patch
-          echo " for (;;) {" >> linux-6.1.patch
-          echo "+#if (LINUX_VERSION_CODE < KERNEL_VERSION(6,1,0))" >> linux-6.1.patch
-          echo "  prepare_to_wait(&thread->wait, &wait, TASK_INTERRUPTIBLE);" >> linux-6.1.patch
-          echo "+#else" >> linux-6.1.patch
-          echo "+ prepare_to_wait(&thread->wait, &wait, TASK_INTERRUPTIBLE|TASK_FREEZABLE);" >> linux-6.1.patch
-          echo "+#endif" >> linux-6.1.patch
-          echo "  if (binder_has_work_ilocked(thread, do_proc_work))" >> linux-6.1.patch
-          echo "   break;" >> linux-6.1.patch
-          echo "  if (do_proc_work)" >> linux-6.1.patch
-          echo "@@ -4129,7 +4135,9 @@ static int binder_wait_for_work(struct binder_thread *thread," >> linux-6.1.patch
-          echo " }" >> linux-6.1.patch
-          echo " finish_wait(&thread->wait, &wait);" >> linux-6.1.patch
-          echo " binder_inner_proc_unlock(proc);" >> linux-6.1.patch
-          echo "+#if (LINUX_VERSION_CODE < KERNEL_VERSION(6,1,0))" >> linux-6.1.patch
-          echo " freezer_count();" >> linux-6.1.patch
-          echo "+#endif" >> linux-6.1.patch
-          echo " return ret;" >> linux-6.1.patch
-          echo " }" >> linux-6.1.patch
-          patch -Np1 -i linux-6.1.patch
+          # 添加 #include <linux/version.h> 如果需要（假设 binder.c 已包含 freezer.h）
+          sed -i '/#include <linux\/freezer.h>/a #include <linux\/version.h>' binder/binder.c
+          # 包裹 freezer_do_not_count()
+          sed -i 's/freezer_do_not_count();/#if (LINUX_VERSION_CODE < KERNEL_VERSION(6,1,0))\nfreezer_do_not_count();\n#endif/' binder/binder.c
+          # 修改 prepare_to_wait 的 TASK_INTERRUPTIBLE
+          sed -i 's/TASK_INTERRUPTIBLE);/#if (LINUX_VERSION_CODE < KERNEL_VERSION(6,1,0))\nTASK_INTERRUPTIBLE\n#else\nTASK_INTERRUPTIBLE|TASK_FREEZABLE\n#endif);/' binder/binder.c
+          # 包裹 freezer_count()
+          sed -i 's/freezer_count();/#if (LINUX_VERSION_CODE < KERNEL_VERSION(6,1,0))\nfreezer_count();\n#endif/' binder/binder.c
           sudo cp -rT binder /usr/src/anbox-binder-1
           sudo dkms install anbox-binder/1
           sudo modprobe binder_linux devices=binder,hwbinder,vndbinder || true
