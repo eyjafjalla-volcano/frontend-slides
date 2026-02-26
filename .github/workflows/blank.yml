@@ -1,6 +1,8 @@
 name: Android Emulator with Tailscale (ARM64 Translation)
 
 on:
+  push:
+    branches: [ main ]
   workflow_dispatch:
     inputs:
       api_level:
@@ -24,6 +26,11 @@ on:
         required: true
         type: boolean
         default: true
+
+env:
+  # 全局环境变量
+  ANDROID_HOME: /usr/local/lib/android/sdk
+  KVM_GROUP: kvm
 
 jobs:
   run-cloud-emulator:
@@ -55,7 +62,9 @@ jobs:
             libxkbcommon-x11-0 \
             libgl1-mesa-glx \
             libegl1-mesa \
-            libdbus-1-3
+            libdbus-1-3 \
+            curl \
+            jq
 
       - name: 启用 KVM (增强版)
         run: |
@@ -65,14 +74,22 @@ jobs:
           ls -la /dev/kvm
           chmod 666 /dev/kvm
           echo "✅ KVM 已启用并验证"
+          
+          # 验证 KVM 可用性
+          if [ ! -e /dev/kvm ]; then
+            echo "::error::KVM 设备不存在"
+            exit 1
+          fi
 
       - name: 配置 Tailscale
+        if: github.event_name == 'workflow_dispatch' || github.event_name == 'push'
         uses: tailscale/github-action@v2
         with:
           authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
           hostname: github-android-emulator-${{ github.run_id }}
 
       - name: 获取 Tailscale IP
+        if: github.event_name == 'workflow_dispatch' || github.event_name == 'push'
         id: tailscale_ip
         run: |
           TS_IP=$(tailscale ip -4)
@@ -85,9 +102,9 @@ jobs:
 
       - name: 运行 Android 模拟器 (支持 ARM64 转译)
         uses: reactivecircus/android-emulator-runner@v2
-        timeout-minutes: ${{ github.event.inputs.runtime_minutes }}
+        timeout-minutes: ${{ github.event.inputs.runtime_minutes || 60 }}
         with:
-          api-level: ${{ github.event.inputs.api_level }}
+          api-level: ${{ github.event.inputs.api_level || 30 }}
           target: ${{ github.event.inputs.enable_arm_translation == true && 'google_apis' || 'default' }}
           arch: x86_64
           profile: pixel_4
@@ -108,7 +125,7 @@ jobs:
             # 等待 ADB 设备就绪
             adb wait-for-device
             
-            # 检查boot_completed状态
+            # 检查 boot_completed 状态
             COUNT=0
             MAX_COUNT=40
             while [ $COUNT -lt $MAX_COUNT ]; do
@@ -137,31 +154,36 @@ jobs:
             sleep 2
             
             # 输出连接信息
-            TS_IP="${{ steps.tailscale_ip.outputs.TS_IP }}"
+            TS_IP="${{ steps.tailscale_ip.outputs.TS_IP || 'localhost' }}"
             echo "======================================================"
             echo "✅ Android Emulator 已就绪！"
             echo "📱 设备信息:"
             adb shell getprop ro.build.version.release
             adb shell getprop ro.product.model
-            echo "🌐 Tailscale IP: $TS_IP"
+            echo "🌐 访问地址: $TS_IP:5555"
             echo "🔌 远程连接命令:"
             echo "   adb connect $TS_IP:5555"
             echo "======================================================"
             
-            # 保持运行
-            echo "⏳ 模拟器将在 ${{ github.event.inputs.runtime_minutes }} 分钟后自动销毁..."
-            REMAINING=$(( ${{ github.event.inputs.runtime_minutes }} * 60 ))
+            # 保持运行并监控设备状态
+            RUNTIME_MINUTES=${{ github.event.inputs.runtime_minutes || 60 }}
+            echo "⏳ 模拟器将在 ${RUNTIME_MINUTES} 分钟后自动销毁..."
+            REMAINING=$((RUNTIME_MINUTES * 60))
+            
             while [ $REMAINING -gt 0 ]; do
               # 检查设备是否仍然在线
               if ! adb devices | grep -q "device$"; then
                 echo "⚠️ 警告: 设备似乎已断开，尝试重新连接..."
                 adb start-server
                 adb tcpip 5555
+                sleep 5
               fi
               sleep 60
               REMAINING=$((REMAINING - 60))
-              if [ $((REMAINING % 300)) -eq 0 ]; then
+              if [ $((REMAINING % 300)) -eq 0 ] && [ $REMAINING -gt 0 ]; then
                 echo "💡 剩余运行时间: $((REMAINING / 60)) 分钟"
+                # 显示设备状态
+                adb devices -l
               fi
             done
             
@@ -171,5 +193,6 @@ jobs:
         if: always()
         run: |
           echo "--- 工作流执行完成 ---"
-          echo "Tailscale IP: ${{ steps.tailscale_ip.outputs.TS_IP }}"
+          echo "Tailscale IP: ${{ steps.tailscale_ip.outputs.TS_IP || 'N/A' }}"
           echo "运行状态: ${{ job.status }}"
+          echo "触发方式: ${{ github.event_name }}"
